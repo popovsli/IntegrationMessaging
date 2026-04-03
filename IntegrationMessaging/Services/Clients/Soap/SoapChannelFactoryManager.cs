@@ -5,7 +5,6 @@ using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.ServiceModel;
-using System.ServiceModel.Channels;
 using System.Text;
 
 namespace IntegrationMessaging.Services.Clients.Soap;

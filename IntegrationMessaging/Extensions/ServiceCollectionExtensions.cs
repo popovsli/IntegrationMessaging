@@ -8,7 +8,6 @@ using IntegrationMessaging.Services.Clients.Soap;
 using IntegrationMessaging.Services.Handlers;
 using IntegrationMessaging.Services.IntegrationClients;
 using IntegrationMessaging.Services.IntegrationClients.Handlers;
-using IntegrationMessaging.Services.IntegrationClients.Options;
 using IntegrationMessaging.Services.Resilience;
 using IntegrationMessaging.Services.Security;
 using IntegrationMessaging.Services.TokenProviders;
@@ -29,11 +28,16 @@ public static class ServiceCollectionExtensions
         string connectionString,
         Action<IntegrationMessagingOptions>? configure = null)
     {
-        // ── Options ───────────────────────────────────────────────────
-        var optBuilder = services.AddOptions<IntegrationMessagingOptions>()
-            .BindConfiguration(IntegrationMessagingOptions.Section);
-        if (configure is not null)
-            optBuilder.Configure(configure);
+        // ── System-specific options ───────────────────────────────────────────
+        services.AddOptions<IntegrationMessagingOptions>()
+            .BindConfiguration(IntegrationMessagingOptions.Section)
+            .Configure(o => configure?.Invoke(o))
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        services.AddOptions<EncryptionOptions>()
+            .BindConfiguration(EncryptionOptions.Section)
+            .ValidateOnStart();
 
         // ── Database ──────────────────────────────────────────────────
         services.AddDbContext<IntegrationDbContext>(opts =>
@@ -43,33 +47,50 @@ public static class ServiceCollectionExtensions
                 sql.CommandTimeout(30);
             }));
 
-        // ── HttpClients ──────────────────────────────────────────────────
-        services.AddHttpClient("BDZ_SITE_SCHEDULE", c =>c.Timeout = TimeSpan.FromSeconds(60));
-        services.AddHttpClient("PORT_A", c => c.Timeout = TimeSpan.FromSeconds(30));
-        services.AddHttpClient("PCS", c => c.Timeout = TimeSpan.FromSeconds(30));
-        services.AddHttpClient("SHIPSAN", c => c.Timeout = TimeSpan.FromSeconds(15));
-        services.AddHttpClient("IntegrationMessaging.Auth");
+        // ── HTTP Clients ──────────────────────────────────────────────────
+        services.AddHttpClient("BDZ_SITE_SCHEDULE",
+            c => c.Timeout = TimeSpan.FromSeconds(60));
 
-        // ── System-specific options ───────────────────────────────────────────
-        services.AddOptions<WasteSoapOptions>().BindConfiguration(WasteSoapOptions.Section);
-        services.AddOptions<EncryptionOptions>().BindConfiguration(EncryptionOptions.Section);
+        services.AddHttpClient("PORT_A",
+            c => c.Timeout = TimeSpan.FromSeconds(30))
+            .AddStandardResilienceHandler();
+
+        services.AddHttpClient("PCS",
+            c => c.Timeout = TimeSpan.FromSeconds(30))
+            .AddStandardResilienceHandler();
+
+        services.AddHttpClient("SHIPSAN",
+            c => c.Timeout = TimeSpan.FromSeconds(15))
+            .AddStandardResilienceHandler();
+
+        // FIX NEW-E: auth client gets resilience so token-endpoint blips are retried
+        services.AddHttpClient("IntegrationMessaging.Auth")
+            .AddStandardResilienceHandler(r =>
+            {
+                r.Retry.MaxRetryAttempts = 2;
+                r.Retry.Delay = TimeSpan.FromMilliseconds(500);
+            });
+
 
         // ── Cache ─────────────────────────────────────────────────────
         services.AddMemoryCache();
 
-        // ── Core Services ─────────────────────────────────────────────
-        services.AddScoped<ITokenProvider, JwtTokenProvider>();
-        services.AddScoped<IEndpointResolver, EndpointResolver>();
-        services.AddScoped<IMessageDispatcher, MessageDispatcher>();
-        services.AddScoped<IMessageProcessor, MessageProcessor>();
-        services.AddScoped<IDeadLetterService, DeadLetterService>();
-
-        services.AddSingleton<IResiliencePipelineFactory, ResiliencePipelineFactory>();
+        // ── Infrastructure (Singleton — process-lifetime caches) ─────────
         services.AddSingleton<IPasswordEncryptor, AesPasswordEncryptor>();
         services.AddSingleton<ICircuitBreakerService, CircuitBreakerService>();
+        services.AddSingleton<IResiliencePipelineFactory, ResiliencePipelineFactory>();
         // Factory manager — Singleton: one cache for the whole process lifetime
         // One line covers ALL typed soap clients — DI resolves TContract automatically
-        services.AddSingleton(typeof(ISoapChannelFactoryManager<>), typeof(SoapChannelFactoryManager<>));
+        services.AddSingleton(
+            typeof(ISoapChannelFactoryManager<>),
+            typeof(SoapChannelFactoryManager<>));
+
+        // ── Core Services ─────────────────────────────────────────────
+        services.AddScoped<IMessageProcessor, MessageProcessor>();
+        services.AddScoped<IMessageDispatcher, MessageDispatcher>();
+        services.AddScoped<IEndpointResolver, EndpointResolver>();
+        services.AddScoped<ITokenProvider, JwtTokenProvider>();
+        services.AddScoped<IDeadLetterService, DeadLetterService>();
 
         // ── REST Client ───────────────────────────────────────────────
         services.AddKeyedScoped<IIntegrationClient, WasteSoapClient>("WASTE_SOAP");

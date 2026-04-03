@@ -1,8 +1,8 @@
 // Services/EndpointResolver.cs
-// FIX #4: null DB miss is no longer cached.
-//         GetOrCreateAsync is replaced with explicit cache-aside logic
-//         so a newly inserted endpoint row becomes visible without
-//         waiting for the TTL to expire.
+// FIX #4 (carried forward): null miss never cached.
+// NEW: Invalidate(systemCode, messageTypeName) exposes manual cache eviction so
+//      an operator updating an IntegrationEndpoint row can flush immediately
+//      without waiting for the TTL.
 
 using IntegrationMessaging.Configuration;
 using IntegrationMessaging.Data;
@@ -19,17 +19,19 @@ public sealed class EndpointResolver(
     IMemoryCache cache,
     IOptions<IntegrationMessagingOptions> options) : IEndpointResolver
 {
+    private static string CacheKey(string systemCode, string typeName) =>
+        $"endpoint:{systemCode}:{typeName}";
+
     public async Task<EndpointResolution> ResolveAsync(
         string systemCode,
         string messageTypeName,
         int entityId,
         CancellationToken ct = default)
     {
-        var cacheKey = $"endpoint:{systemCode}:{messageTypeName}";
+        var key = CacheKey(systemCode, messageTypeName);
         var ttl = TimeSpan.FromMinutes(options.Value.EndpointCacheMinutes);
 
-        // FIX #4: check cache first; only write to cache on a successful DB hit
-        if (cache.TryGetValue(cacheKey, out EndpointResolution? cached) && cached is not null)
+        if (cache.TryGetValue(key, out EndpointResolution? cached) && cached is not null)
             return cached;
 
         var endpoint = await db.IntegrationEndpoints
@@ -46,14 +48,17 @@ public sealed class EndpointResolver(
 
         var resolvedPath = endpoint.EndpointPath
             .Replace("{EntityId}", entityId.ToString(),
-                StringComparison.OrdinalIgnoreCase);
+                     StringComparison.OrdinalIgnoreCase);
 
         var resolution = new EndpointResolution(
-            resolvedPath, endpoint.HttpMethod, endpoint.SoapAction);
+            resolvedPath,
+            endpoint.HttpMethod,
+            endpoint.SoapAction);
 
-        // FIX #4: only cache on success — a null miss never enters the cache
-        cache.Set(cacheKey, resolution, ttl);
-
+        cache.Set(key, resolution, ttl);
         return resolution;
     }
+
+    public void Invalidate(string systemCode, string messageTypeName) =>
+        cache.Remove(CacheKey(systemCode, messageTypeName));
 }

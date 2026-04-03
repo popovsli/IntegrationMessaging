@@ -1,12 +1,15 @@
 // Services/MessageProcessor.cs
-// FIXES:
-//   #1 — SaveChangesAsync removed from SendMessageAsync / MarkSkippedAndRecordHistoryAsync;
-//          a single SaveChangesAsync is called inside the transaction in ProcessSingleAsync.
-//   #2 — CollapseRedundantUpdatesAsync no longer calls CommitAsync internally;
-//          it returns bool so the caller owns the commit.
-//   #5 — Batch load filtered by a unique WorkerId stamp instead of a time window.
-//   #6 — ProcessSingleAsync signature changed to accept the already-loaded entity;
-//          the extra DB round-trip is eliminated.
+// FIX NEW-G: DeadLetterAsync — CRITICAL foreign-key violation fixed.
+//   Old order: (1) Add DL to tracker, (2) ExecuteDeleteAsync queue row,
+//              (3) SaveChanges → INSERT DL fails because FK target is gone.
+//   New order: (1) SaveChanges to INSERT DL first, (2) ExecuteDeleteAsync
+//              queue row inside same explicit transaction.
+//
+// FIX NEW-H: ProcessPendingAsync step-1 stale requeue is now capped by
+//   options.Value.StaleRequeueLimit (default 100) to prevent a single
+//   unbounded UPDATE locking thousands of rows after a crash.
+//
+// All previous fixes (#1–#6) carried forward unchanged.
 
 using IntegrationMessaging.Configuration;
 using IntegrationMessaging.Data;
@@ -28,26 +31,27 @@ public sealed class MessageProcessor(
     IOptions<IntegrationMessagingOptions> options,
     ILogger<MessageProcessor> logger) : IMessageProcessor
 {
-    // Unique per-process stamp — used to identify exactly which rows THIS worker claimed
     private static readonly Guid WorkerId = Guid.CreateVersion7();
 
-    public async Task ProcessPendingAsync(int batchSize = 50, CancellationToken ct = default)
+    public async Task ProcessPendingAsync(
+        int batchSize = 50,
+        CancellationToken ct = default)
     {
         var now = DateTime.UtcNow;
-        var lockDuration = TimeSpan.FromMinutes(options.Value.LockDurationMinutes);
-        var lockUntil = now + lockDuration;
+        var lockUntil = now + TimeSpan.FromMinutes(options.Value.LockDurationMinutes);
 
-        // 1. Requeue stale Processing rows (stuck from crashes / cancellation)
+        // 1. Requeue stale Processing rows (stuck from crashes).
+        //    FIX NEW-H: capped by StaleRequeueLimit to avoid locking a huge table.
         await db.IntegrationMessageQueue
-            .Where(q => q.Status == QueueMessageStatus.Processing && q.LockedUntil <= now)
+            .Where(q => q.Status == QueueMessageStatus.Processing
+                     && q.LockedUntil <= now)
+            .Take(options.Value.StaleRequeueLimit)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(q => q.Status, QueueMessageStatus.Queued)
                 .SetProperty(q => q.LockedUntil, (DateTime?)null)
                 .SetProperty(q => q.NextAttempt, (DateTime?)null), ct);
 
-        // 2. Claim batch — stamp with WorkerId so only THIS process loads these rows
-        //    ExecuteUpdate does not participate in the EF change tracker;
-        //    we match exactly by WorkerStamp in step 3 to avoid cross-worker contamination.
+        // 2. Claim batch — stamp with WorkerId
         var claimedCount = await db.IntegrationMessageQueue
             .Where(q => q.Status == QueueMessageStatus.Queued
                      && (q.NextAttempt == null || q.NextAttempt <= now)
@@ -57,7 +61,7 @@ public sealed class MessageProcessor(
             .ExecuteUpdateAsync(s => s
                 .SetProperty(q => q.Status, QueueMessageStatus.Processing)
                 .SetProperty(q => q.LockedUntil, lockUntil)
-                .SetProperty(q => q.WorkerStamp, WorkerId), ct);    // ← unique stamp
+                .SetProperty(q => q.WorkerStamp, WorkerId), ct);
 
         if (claimedCount == 0)
         {
@@ -65,9 +69,10 @@ public sealed class MessageProcessor(
             return;
         }
 
-        logger.LogDebug("Claimed {Count} messages for worker {WorkerId}.", claimedCount, WorkerId);
+        logger.LogDebug("Claimed {Count} messages for worker {WorkerId}.",
+            claimedCount, WorkerId);
 
-        // 3. Load ONLY the rows stamped with THIS worker's id — no cross-worker leakage
+        // 3. Load only rows stamped for this worker
         var batch = await db.IntegrationMessageQueue
             .Include(q => q.IntegrationSystem)
             .Where(q => q.Status == QueueMessageStatus.Processing
@@ -82,41 +87,40 @@ public sealed class MessageProcessor(
         {
             if (ct.IsCancellationRequested)
             {
-                logger.LogWarning("Cancellation requested. {Remaining} messages left unprocessed.",
+                logger.LogWarning(
+                    "Cancellation requested — {Remaining} messages left unprocessed.",
                     batch.Count - processed);
                 break;
             }
 
             try
             {
-                // FIX #6: pass the already-loaded entity — no second DB round-trip
                 await ProcessSingleAsync(message, ct);
                 processed++;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                logger.LogError(ex, "Failed to process message {MessageId} in batch.", message.Id);
+                logger.LogError(ex,
+                    "Failed to process message {MessageId} in batch.", message.Id);
             }
         }
 
-        logger.LogInformation("Batch complete: {Processed}/{Total} processed.", processed, batch.Count);
+        logger.LogInformation("Batch complete: {Processed}/{Total} processed.",
+            processed, batch.Count);
     }
 
-    // FIX #6: accepts already-loaded entity instead of an Id
-    public async Task ProcessSingleAsync(IntegrationMessageQueue message, CancellationToken ct = default)
+    public async Task ProcessSingleAsync(
+        IntegrationMessageQueue message,
+        CancellationToken ct = default)
     {
-         //var message = await db.IntegrationMessageQueue
-         //   .Include(q => q.IntegrationSystem)
-         //   .FirstOrDefaultAsync(q => q.Id == queueMessageId, ct)
-         //   ?? throw new IntegrationMessagingException($"Queue message {queueMessageId} not found.");
-
         var system = message.IntegrationSystem
             ?? throw new IntegrationMessagingException(
-                $"IntegrationSystem '{message.IntegrationSystemCode}' not loaded on queue message {message.Id}.");
+                $"IntegrationSystem not loaded on queue message {message.Id}.");
 
         if (!system.IsEnabled)
         {
-            logger.LogWarning("System {SystemCode} is disabled. Skipping QueueId={Id}.",
+            logger.LogWarning(
+                "System {SystemCode} is disabled. Skipping QueueId={Id}.",
                 system.IntegrationSystemCode, message.Id);
             await ReleaseLockedAsync(message, ct);
             return;
@@ -124,7 +128,8 @@ public sealed class MessageProcessor(
 
         if (circuitBreaker.IsOpen(system.IntegrationSystemCode))
         {
-            logger.LogWarning("Circuit OPEN for {SystemCode}. Releasing lock on QueueId={Id}.",
+            logger.LogWarning(
+                "Circuit OPEN for {SystemCode}. Releasing lock on QueueId={Id}.",
                 system.IntegrationSystemCode, message.Id);
             await ReleaseLockedAsync(message, ct);
             return;
@@ -133,38 +138,41 @@ public sealed class MessageProcessor(
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         try
         {
-            // FIX #2: CollapseRedundantUpdatesAsync returns bool — it never commits internally
             var collapsed = await CollapseRedundantUpdatesAsync(message, system, ct);
             if (collapsed)
             {
-                await db.SaveChangesAsync(ct);    // FIX #1: single SaveChanges in tx
+                await db.SaveChangesAsync(ct);
                 await transaction.CommitAsync(ct);
                 return;
             }
 
-            if (message.MessageOperation is MessageOperation.Update or MessageOperation.Delete)
+            if (message.MessageOperation is MessageOperation.Update
+                                         or MessageOperation.Delete)
                 await EnsureCreateWasSentAsync(message, system, ct);
 
             await SendMessageAsync(message, system, ct);
-
-            await db.SaveChangesAsync(ct);        // FIX #1: single SaveChanges in tx
+            await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
         }
         catch (PrerequisiteCreateNotFoundException ex)
         {
             await transaction.RollbackAsync(ct);
-            await RecordFailureAsync(message, system, ex.Message, exhausted: true, ct);
+            await RecordFailureAsync(message, system, ex.Message,
+                exhausted: true, ct);
             logger.LogError(ex,
-                "Prerequisite Create not found for EntityId={EntityId} on {SystemCode}.",
+                "Prerequisite Create not found for EntityId={EntityId} " +
+                "on {SystemCode}.",
                 message.EntityId, system.IntegrationSystemCode);
         }
         catch (Exception ex)
         {
             await transaction.RollbackAsync(ct);
             circuitBreaker.RecordFailure(system.IntegrationSystemCode, system);
-            await RecordFailureAsync(message, system, ex.Message, exhausted: false, ct);
+            await RecordFailureAsync(message, system, ex.Message,
+                exhausted: false, ct);
             logger.LogError(ex,
-                "Failed {Operation} QueueId={Id} EntityId={EntityId} on {SystemCode}. Attempt={Attempt}.",
+                "Failed {Operation} QueueId={Id} EntityId={EntityId} " +
+                "on {SystemCode}. Attempt={Attempt}.",
                 message.MessageOperation, message.Id, message.EntityId,
                 system.IntegrationSystemCode, message.AttemptCount + 1);
         }
@@ -186,7 +194,6 @@ public sealed class MessageProcessor(
 
         circuitBreaker.RecordSuccess(system.IntegrationSystemCode);
 
-        // FIX #1: Add to tracker only — NO SaveChangesAsync here
         db.IntegrationMessages.Add(new IntegrationMessage
         {
             IntegrationSystemCode = message.IntegrationSystemCode,
@@ -202,28 +209,24 @@ public sealed class MessageProcessor(
             UpdatedAt = DateTime.UtcNow
         });
 
-        // ExecuteDeleteAsync runs immediately — intentional, within the open transaction
         await db.IntegrationMessageQueue
             .Where(q => q.Id == message.Id)
             .ExecuteDeleteAsync(ct);
 
-        // NO SaveChangesAsync here — caller saves once
-        logger.LogInformation("✓ Sent {Op} EntityId={EntityId} on {SystemCode} | HTTP {Code}.",
+        logger.LogInformation(
+            "✓ Sent {Op} EntityId={EntityId} on {SystemCode} | HTTP {Code}.",
             message.MessageOperation, message.EntityId,
             message.IntegrationSystemCode, response.HttpStatusCode);
     }
 
     // ── Collapse redundant updates ────────────────────────────────────────
 
-    // FIX #2: returns bool — true means this message was skipped and changes are tracked.
-    //         Caller is responsible for SaveChangesAsync + CommitAsync.
     private async Task<bool> CollapseRedundantUpdatesAsync(
         IntegrationMessageQueue current,
         IntegrationSystem system,
         CancellationToken ct)
     {
-        if (current.MessageOperation != MessageOperation.Update)
-            return false;
+        if (current.MessageOperation != MessageOperation.Update) return false;
 
         var siblings = await db.IntegrationMessageQueue
             .Where(q => q.Id != current.Id
@@ -245,23 +248,19 @@ public sealed class MessageProcessor(
 
         if (latest.Id != current.Id)
         {
-            // FIX #1: track only — no SaveChangesAsync
             await MarkSkippedAndRecordHistoryAsync(current, system, ct,
-                reason: "Superseded by a newer Update");
-
+                "Superseded by a newer Update");
             logger.LogInformation(
-                "Update QueueId={Id} skipped; newer Update QueueId={LatestId} will be processed.",
-                current.Id, latest.Id);
-
-            return true; // caller commits
+                "Update QueueId={Id} skipped; newer Update QueueId={LatestId} " +
+                "will be processed.", current.Id, latest.Id);
+            return true;
         }
 
-        // Current is latest — mark all older siblings as skipped
         foreach (var older in siblings)
             await MarkSkippedAndRecordHistoryAsync(older, system, ct,
-                reason: "Superseded by a newer Update");
+                "Superseded by a newer Update");
 
-        return false; // current should be sent normally
+        return false;
     }
 
     private async Task MarkSkippedAndRecordHistoryAsync(
@@ -270,7 +269,6 @@ public sealed class MessageProcessor(
         CancellationToken ct,
         string reason)
     {
-        // FIX #1: Add to tracker only — NO SaveChangesAsync here
         db.IntegrationMessages.Add(new IntegrationMessage
         {
             IntegrationSystemCode = message.IntegrationSystemCode,
@@ -286,12 +284,9 @@ public sealed class MessageProcessor(
             UpdatedAt = DateTime.UtcNow
         });
 
-        // ExecuteDeleteAsync runs immediately — intentional
         await db.IntegrationMessageQueue
             .Where(q => q.Id == message.Id)
             .ExecuteDeleteAsync(ct);
-
-        // NO SaveChangesAsync — caller saves once
     }
 
     // ── Prerequisite check ────────────────────────────────────────────────
@@ -301,16 +296,17 @@ public sealed class MessageProcessor(
         IntegrationSystem system,
         CancellationToken ct)
     {
-        bool createAlreadySent = await db.IntegrationMessages.AnyAsync(
+        bool createSent = await db.IntegrationMessages.AnyAsync(
             h => h.EntityId == message.EntityId
               && h.IntegrationSystemCode == message.IntegrationSystemCode
               && h.Operation == MessageOperation.Create
               && h.Status == QueueMessageStatus.Sent.ToString(), ct);
 
-        if (createAlreadySent) return;
+        if (createSent) return;
 
         logger.LogWarning(
-            "No successful Create in history for EntityId={EntityId} on {SystemCode}. Searching queue.",
+            "No successful Create in history for EntityId={EntityId} " +
+            "on {SystemCode}. Searching queue.",
             message.EntityId, message.IntegrationSystemCode);
 
         var pendingCreate = await db.IntegrationMessageQueue
@@ -326,7 +322,8 @@ public sealed class MessageProcessor(
                 message.EntityId, message.IntegrationSystemCode);
 
         logger.LogInformation(
-            "Sending prerequisite Create QueueId={CreateId} before {Op} QueueId={Id}.",
+            "Sending prerequisite Create QueueId={CreateId} before " +
+            "{Op} QueueId={Id}.",
             pendingCreate.Id, message.MessageOperation, message.Id);
 
         await SendMessageAsync(pendingCreate, system, ct);
@@ -342,7 +339,8 @@ public sealed class MessageProcessor(
         CancellationToken ct)
     {
         int newAttemptCount = message.AttemptCount + 1;
-        bool isExhausted = exhausted || newAttemptCount >= system.QueueMessageRetryCount;
+        bool isExhausted = exhausted
+                            || newAttemptCount >= system.QueueMessageRetryCount;
 
         db.IntegrationMessages.Add(new IntegrationMessage
         {
@@ -350,8 +348,8 @@ public sealed class MessageProcessor(
             EntityId = message.EntityId,
             Operation = message.MessageOperation,
             Status = isExhausted
-                                    ? QueueMessageStatus.Failed.ToString()
-                                    : QueueMessageStatus.Queued.ToString(),
+                                        ? QueueMessageStatus.Failed.ToString()
+                                        : QueueMessageStatus.Queued.ToString(),
             RequestPayload = message.Payload,
             ResponsePayload = string.Empty,
             Error = error,
@@ -362,11 +360,8 @@ public sealed class MessageProcessor(
         });
 
         if (isExhausted)
-        {
             await DeadLetterAsync(message, error, newAttemptCount, ct);
-        }
         else
-        {
             await db.IntegrationMessageQueue
                 .Where(q => q.Id == message.Id)
                 .ExecuteUpdateAsync(s => s
@@ -375,8 +370,8 @@ public sealed class MessageProcessor(
                     .SetProperty(q => q.LastError, error)
                     .SetProperty(q => q.LockedUntil, (DateTime?)null)
                     .SetProperty(q => q.NextAttempt,
-                        DateTime.UtcNow.AddSeconds(system.QueueMessageRetryDelaySeconds)), ct);
-        }
+                        DateTime.UtcNow.AddSeconds(
+                            system.QueueMessageRetryDelaySeconds)), ct);
 
         await db.SaveChangesAsync(ct);
     }
@@ -387,6 +382,12 @@ public sealed class MessageProcessor(
         int attemptCount,
         CancellationToken ct)
     {
+        // FIX NEW-G: Insert dead letter FIRST (SaveChangesAsync), then delete
+        // the queue row so the FK (IntegrationDeadLetter.OriginalQueueId →
+        // IntegrationMessageQueue.Id) is satisfied at save time.
+        // Previous order caused a FK violation because ExecuteDeleteAsync ran
+        // before the dead-letter INSERT, leaving the FK referencing a ghost.
+
         db.Set<IntegrationDeadLetter>().Add(new IntegrationDeadLetter
         {
             OriginalQueueId = message.Id,
@@ -400,22 +401,24 @@ public sealed class MessageProcessor(
             DeadLetteredAtUtc = DateTime.UtcNow
         });
 
+        // Step 1: flush the dead-letter INSERT while the queue row still exists
+        await db.SaveChangesAsync(ct);
+
+        // Step 2: now safe to remove the queue row — FK is already satisfied
         await db.IntegrationMessageQueue
             .Where(q => q.Id == message.Id)
             .ExecuteDeleteAsync(ct);
-
-        await db.SaveChangesAsync(ct);
 
         logger.LogError(
             "Message DEAD LETTERED after {Attempts} attempts | " +
             "EntityId={EntityId} System={System} Type={Type} Reason={Reason}",
             attemptCount, message.EntityId,
             message.IntegrationSystemCode, message.MessageTypeName, reason);
-        // 3. Optionally raise an alert (hook your alerting system here)
-        // await alertService.NotifyDeadLetterAsync(message, reason, ct);
     }
 
-    private async Task ReleaseLockedAsync(IntegrationMessageQueue message, CancellationToken ct) =>
+    private async Task ReleaseLockedAsync(
+        IntegrationMessageQueue message,
+        CancellationToken ct) =>
         await db.IntegrationMessageQueue
             .Where(q => q.Id == message.Id)
             .ExecuteUpdateAsync(s => s

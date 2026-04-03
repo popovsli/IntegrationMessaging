@@ -1,13 +1,6 @@
 ﻿// Services/Clients/Base/SoapIntegrationClientBase.cs
-// FIXES applied:
-//   — IResiliencePipelineFactory injected (was missing entirely)
-//   — CommunicationException / TimeoutException rethrown bare so Polly can retry
-//   — Wrapping into IntegrationMessagingException happens only in SendAsync
-//     after Polly exhausts all retries
-//   — reply.IsFault log removed (misleading — SoapFaultParser is the authority)
-//   — Task.Factory.FromAsync + .WaitAsync(ct) replaces BeginRequest/EndRequest
-//   — BuildUrl passthrough wrapper removed; UrlBuilder.Build called directly
-//   — SystemName + SystemCode added to all log calls
+// FIX NEW-F: XmlReaderSettings and XmlWriterSettings promoted to static
+//            readonly — avoids per-call heap allocation on every SOAP message.
 
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Exceptions;
@@ -27,6 +20,19 @@ public abstract class SoapIntegrationClientBase(
     IResiliencePipelineFactory pipelineFactory,
     ILogger logger) : IIntegrationClient
 {
+    // FIX NEW-F: static readonly — allocated once per AppDomain
+    private static readonly XmlReaderSettings ReaderSettings = new()
+    {
+        ConformanceLevel = ConformanceLevel.Fragment,
+        DtdProcessing = DtdProcessing.Prohibit
+    };
+
+    private static readonly XmlWriterSettings WriterSettings = new()
+    {
+        Encoding = Encoding.UTF8,
+        OmitXmlDeclaration = true
+    };
+
     protected abstract ChannelFactory<IRequestChannel> CreateFactory(
         string username, string password);
 
@@ -40,7 +46,7 @@ public abstract class SoapIntegrationClientBase(
         if (string.IsNullOrWhiteSpace(request.SoapAction))
             throw new IntegrationMessagingException(
                 $"{GetType().Name} requires SoapAction on IntegrationRequest. " +
-                $"Set IntegrationEndpoint.SoapAction for system " +
+                $"Set IntegrationEndpoint.SoapAction for " +
                 $"'{system.IntegrationSystemCode}'.");
 
         var pipeline = pipelineFactory.CreateSoapPipeline(system);
@@ -83,16 +89,14 @@ public abstract class SoapIntegrationClientBase(
         try
         {
             var factory = factoryManager.GetOrCreate(system, CreateFactory);
-
             channel = factory.CreateChannel(new EndpointAddress(url));
             channel.Open();
 
-            using var wcfMessage = CreateMessage(request.Payload!, request.SoapAction!);
+            using var wcfMsg = CreateMessage(request.Payload!, request.SoapAction!);
 
-            // .WaitAsync(ct) propagates cancellation; BeginRequest/EndRequest ignored ct entirely
             using var reply = await Task.Factory
                 .FromAsync(
-                    channel.BeginRequest(wcfMessage, null, null),
+                    channel.BeginRequest(wcfMsg, null, null),
                     channel.EndRequest)
                 .WaitAsync(ct);
 
@@ -119,11 +123,7 @@ public abstract class SoapIntegrationClientBase(
 
             return IntegrationResponse.Ok(SoapFaultParser.ExtractBody(xml));
         }
-        catch (IntegrationMessagingException)
-        {
-            channel?.Abort();
-            throw;
-        }
+        catch (IntegrationMessagingException) { channel?.Abort(); throw; }
         catch (CommunicationException ex)
         {
             channel?.Abort();
@@ -132,7 +132,7 @@ public abstract class SoapIntegrationClientBase(
                 "{Client} CommunicationException (retry eligible) | " +
                 "System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;  // Polly retries; SendAsync wraps after exhaustion
+            throw;
         }
         catch (TimeoutException ex)
         {
@@ -140,7 +140,7 @@ public abstract class SoapIntegrationClientBase(
             logger.LogWarning(ex,
                 "{Client} Timeout (retry eligible) | System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;  // Polly retries
+            throw;
         }
         catch (Exception ex)
         {
@@ -155,16 +155,13 @@ public abstract class SoapIntegrationClientBase(
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────
+    // ── Helpers (use static settings) ────────────────────────────────────
 
     private static Message CreateMessage(string bodyXml, string soapAction)
     {
         try
         {
-            using var reader = XmlReader.Create(
-                new StringReader(bodyXml),
-                new XmlReaderSettings { ConformanceLevel = ConformanceLevel.Fragment });
-
+            using var reader = XmlReader.Create(new StringReader(bodyXml), ReaderSettings);
             return Message.CreateMessage(MessageVersion.Soap11, soapAction, reader);
         }
         catch (XmlException ex)
@@ -177,11 +174,7 @@ public abstract class SoapIntegrationClientBase(
     private static string ReadMessage(Message message)
     {
         var sb = new StringBuilder();
-        using var writer = XmlWriter.Create(sb, new XmlWriterSettings
-        {
-            Encoding = Encoding.UTF8,
-            OmitXmlDeclaration = true
-        });
+        using var writer = XmlWriter.Create(sb, WriterSettings);
         message.WriteMessage(writer);
         writer.Flush();
         return sb.ToString();

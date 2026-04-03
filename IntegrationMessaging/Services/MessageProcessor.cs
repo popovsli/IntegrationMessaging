@@ -210,7 +210,7 @@ public sealed class MessageProcessor(
 
         circuitBreaker.RecordSuccess(system.IntegrationSystemCode);
 
-        db.IntegrationMessage.Add(new IntegrationMessage
+        db.IntegrationMessages.Add(new IntegrationMessage
         {
             IntegrationSystemCode = message.IntegrationSystemCode,
             EntityId = message.EntityId,

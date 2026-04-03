@@ -25,7 +25,7 @@ public sealed class EndpointResolver(
         var endpoint = await cache.GetOrCreateAsync(cacheKey, async entry =>
         {
             entry.AbsoluteExpirationRelativeToNow = ttl;
-            return await db.IntegrationEndpoint
+            return await db.IntegrationEndpoints
                 .AsNoTracking()
                 .FirstOrDefaultAsync(
                     e => e.IntegrationSystemCode == systemCode

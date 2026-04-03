@@ -59,7 +59,7 @@ public sealed class DeadLetterService(
         string? resolutionNote = null,
         CancellationToken ct = default)
     {
-        var unresolved = await db.IntegrationDeadLetter
+        var unresolved = await db.IntegrationDeadLetters
             .Where(d => d.IntegrationSystemCode == integrationSystemCode
                      && d.ResolvedAtUtc == null)
             .OrderBy(d => d.DeadLetteredAtUtc)
@@ -148,7 +148,7 @@ public sealed class DeadLetterService(
     private async Task<IntegrationDeadLetter> LoadUnresolvedAsync(
         int deadLetterId, CancellationToken ct)
     {
-        var deadLetter = await db.IntegrationDeadLetter
+        var deadLetter = await db.IntegrationDeadLetters
             .FirstOrDefaultAsync(d => d.Id == deadLetterId, ct)
             ?? throw new IntegrationMessagingException(
                 $"Dead letter {deadLetterId} not found.");

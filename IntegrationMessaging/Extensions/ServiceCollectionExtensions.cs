@@ -9,6 +9,7 @@ using IntegrationMessaging.Services.Handlers;
 using IntegrationMessaging.Services.IntegrationClients;
 using IntegrationMessaging.Services.IntegrationClients.Handlers;
 using IntegrationMessaging.Services.IntegrationClients.Options;
+using IntegrationMessaging.Services.Resilience;
 using IntegrationMessaging.Services.Security;
 using IntegrationMessaging.Services.TokenProviders;
 using IntegrationMessaging.Workers;
@@ -96,12 +97,12 @@ public static class ServiceCollectionExtensions
 
         // ── Core Services ─────────────────────────────────────────────
         services.AddSingleton<ICircuitBreakerService, CircuitBreakerService>();
-        services.AddSingleton<ISoapChannelFactory, SoapChannelFactory>();
         services.AddScoped<ITokenProvider, JwtTokenProvider>();
         services.AddScoped<IEndpointResolver, EndpointResolver>();
         services.AddScoped<IMessageDispatcher, MessageDispatcher>();
         services.AddScoped<IMessageProcessor, MessageProcessor>();
         services.AddScoped<IDeadLetterService, DeadLetterService>();
+        services.AddSingleton<IResiliencePipelineFactory, ResiliencePipelineFactory>();
 
         // ── REST Client ───────────────────────────────────────────────
         //services.AddKeyedScoped<IIntegrationClient, RestJwtIntegrationClient>(ClientKeys.RestJwt);

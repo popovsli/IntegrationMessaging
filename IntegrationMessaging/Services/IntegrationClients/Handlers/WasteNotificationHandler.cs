@@ -21,15 +21,11 @@ public sealed class WasteNotificationHandler(IEndpointResolver endpointResolver)
         var resolution = await endpointResolver.ResolveAsync(
             q.IntegrationSystemCode, q.MessageTypeName, q.EntityId, ct);
 
-        bool isSoap = context.System.ClientType
-            .StartsWith("SOAP", StringComparison.OrdinalIgnoreCase);
 
-        var payload = (q.MessageOperation, isSoap) switch
+        var payload = (q.MessageOperation) switch
         {
-            (MessageOperation.Create or MessageOperation.Update, false) => BuildJsonPayload(q.Payload),
-            (MessageOperation.Delete, false) => BuildJsonDeletePayload(q.EntityId),
-            (MessageOperation.Create or MessageOperation.Update, true) => BuildXmlPayload(q.Payload, q.EntityId),
-            (MessageOperation.Delete, true) => BuildXmlDeletePayload(q.EntityId),
+            (MessageOperation.Create or MessageOperation.Update) => BuildJsonPayload(q.Payload),
+            (MessageOperation.Delete) => BuildJsonDeletePayload(q.EntityId),
             _ => throw new IntegrationMessagingException(
                     $"Unhandled operation '{q.MessageOperation}' for {MessageTypeName}.")
         };

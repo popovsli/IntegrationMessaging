@@ -1,5 +1,7 @@
+// Services/TokenProviders/JwtTokenProvider.cs
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Exceptions;
+using IntegrationMessaging.Services.Security;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using System.Text;
@@ -10,27 +12,43 @@ namespace IntegrationMessaging.Services.TokenProviders;
 public sealed class JwtTokenProvider(
     IHttpClientFactory httpFactory,
     IMemoryCache cache,
+    IPasswordEncryptor encryptor,
     ILogger<JwtTokenProvider> logger) : ITokenProvider
 {
     private sealed record TokenResponse(string AccessToken, int ExpiresIn);
 
-    public async Task<string> GetTokenAsync(IntegrationSystem system, CancellationToken ct = default)
+    public async Task<string> GetTokenAsync(
+        IntegrationSystem system, CancellationToken ct = default)
     {
+        // Guard: auth URL must be configured for JWT systems
+        if (string.IsNullOrWhiteSpace(system.AuthUrl))
+            throw new IntegrationMessagingException(
+                $"JwtTokenProvider requires AuthUrl to be set for " +
+                $"system '{system.IntegrationSystemCode}'. " +
+                $"Set IntegrationSystem.AuthUrl to the full token endpoint URL.");
+
         var cacheKey = $"token:{system.IntegrationSystemCode}";
 
-        if (cache.TryGetValue(cacheKey, out string? cachedToken) && cachedToken is not null)
-            return cachedToken;
+        if (cache.TryGetValue(cacheKey, out string? cached) && cached is not null)
+            return cached;
 
         logger.LogDebug("Fetching new token for system {SystemCode}.", system.IntegrationSystemCode);
 
-        var client  = httpFactory.CreateClient("IntegrationMessaging.Auth");
-        var authUrl = $"{system.BaseAddress.TrimEnd('/')}/{system.AuthEndpointPath.TrimStart('/')}";
+        // AuthUrl is absolute — used directly, never combined with BaseAddress
+        var authUrl = system.AuthUrl;
+
+        // Decrypt password at call time — never stored in memory long-term
+        var password = string.IsNullOrWhiteSpace(system.PasswordEncrypted)
+            ? string.Empty
+            : encryptor.Decrypt(system.PasswordEncrypted);
 
         var body = JsonSerializer.Serialize(new
         {
             username = system.UserName,
-            password = system.PasswordSecret
+            password
         });
+
+        var client = httpFactory.CreateClient("IntegrationMessaging.Auth");
 
         using var response = await client.PostAsync(
             authUrl,
@@ -44,8 +62,8 @@ public sealed class JwtTokenProvider(
                 $"Token request failed for '{system.IntegrationSystemCode}': " +
                 $"HTTP {(int)response.StatusCode} — {content[..Math.Min(500, content.Length)]}");
 
-        var tokenResponse = JsonSerializer.Deserialize<TokenResponse>(content,
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+        var tokenResponse = JsonSerializer.Deserialize<TokenResponse>(
+            content, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
             ?? throw new IntegrationMessagingException(
                 $"Invalid token response for '{system.IntegrationSystemCode}'.");
 

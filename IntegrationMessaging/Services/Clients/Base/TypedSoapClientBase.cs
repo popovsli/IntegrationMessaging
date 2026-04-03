@@ -4,16 +4,18 @@ using IntegrationMessaging.Exceptions;
 using IntegrationMessaging.Models;
 using IntegrationMessaging.Services.Clients;
 using IntegrationMessaging.Services.Clients.Soap;
+using IntegrationMessaging.Services.Resilience;
 using Microsoft.Extensions.Logging;
 using System.ServiceModel;
 
 public abstract class TypedSoapClientBase<TContract>(
-    ISoapChannelFactoryManager<TContract> factoryManager,  // ← actually used now
+    ISoapChannelFactoryManager<TContract> factoryManager,
+    IResiliencePipelineFactory pipelineFactory,
     ILogger logger) : IIntegrationClient
     where TContract : class
 {
     protected abstract ChannelFactory<TContract> CreateFactory(
-        string username, string password);
+      string username, string password);
 
     /// <summary>
     /// Executes the typed WCF call.
@@ -27,12 +29,42 @@ public abstract class TypedSoapClientBase<TContract>(
         CancellationToken ct);
 
     public async Task<IntegrationResponse> SendAsync(
+      IntegrationRequest request,
+      IntegrationSystem system,
+      CancellationToken ct = default)
+    {
+        var pipeline = pipelineFactory.CreateSoapPipeline(system);
+        try
+        {
+            return await pipeline.ExecuteAsync(
+                async token => await ExecuteOnceAsync(request, system, token), ct);
+        }
+        catch (CommunicationException ex)
+        {
+            // Polly exhausted all retries — wrap for caller
+            throw new IntegrationMessagingException(
+                $"{GetType().Name}: WCF communication failed for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}) " +
+                $"after {system.ClientRetryCount} retries — {ex.Message}", ex);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new IntegrationMessagingException(
+                $"{GetType().Name}: WCF timed out for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}) " +
+                $"after {system.ClientRetryCount} retries — {ex.Message}", ex);
+        }
+    }
+
+    private async Task<IntegrationResponse> ExecuteOnceAsync(
         IntegrationRequest request,
         IntegrationSystem system,
         CancellationToken ct = default)
     {
         var url = BuildUrl(system, request);
-        logger.LogDebug("{Client} → {Url}", GetType().Name, url);
+
+        logger.LogDebug("{Client} → {Url} | System={SystemName} [{SystemCode}]",
+                   GetType().Name, url, system.SystemName, system.IntegrationSystemCode);
 
         TContract? channel = default;
         try
@@ -48,31 +80,33 @@ public abstract class TypedSoapClientBase<TContract>(
             SafeClose((IClientChannel)channel);
             channel = default;
 
+            logger.LogDebug("{Client} ← success | System={SystemName} [{SystemCode}]",
+               GetType().Name, system.SystemName, system.IntegrationSystemCode);
+
             return IntegrationResponse.Ok(payload);  // null is fine — Ok() accepts null
-        }
-        catch (FaultException ex)
-        {
-            ((IClientChannel?)channel)?.Abort();
-            logger.LogWarning("{Client} SOAP Fault: {Message}", GetType().Name, ex.Message);
-            return IntegrationResponse.FaultFromException(ex);
         }
         catch (CommunicationException ex)
         {
+            // Transient — invalidate factory, rethrow for Polly to retry
             ((IClientChannel?)channel)?.Abort();
-            factoryManager.Invalidate(system.IntegrationSystemCode);  // ← manager owns this
-            logger.LogError(ex, "{Client} CommunicationException", GetType().Name);
-            throw new IntegrationMessagingException(
-                $"{GetType().Name}: WCF communication failed — {ex.Message}", ex);
+            factoryManager.Invalidate(system.IntegrationSystemCode);
+            logger.LogWarning(ex,
+                "{Client} CommunicationException (retry eligible) | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
+            throw;
         }
         catch (TimeoutException ex)
         {
+            // Transient — rethrow for Polly to retry
             ((IClientChannel?)channel)?.Abort();
-            logger.LogError(ex, "{Client} Timeout", GetType().Name);
-            throw new IntegrationMessagingException(
-                $"{GetType().Name}: WCF timed out — {ex.Message}", ex);
+            logger.LogWarning(ex,
+                "{Client} Timeout (retry eligible) | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
+            throw;
         }
         catch (IntegrationMessagingException)
         {
+            // Config/contract error — never retry
             ((IClientChannel?)channel)?.Abort();
             throw;
         }
@@ -80,18 +114,17 @@ public abstract class TypedSoapClientBase<TContract>(
         {
             ((IClientChannel?)channel)?.Abort();
             factoryManager.Invalidate(system.IntegrationSystemCode);
-            logger.LogError(ex, "{Client} unexpected error", GetType().Name);
+            logger.LogError(ex,
+                "{Client} unexpected error | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
             throw new IntegrationMessagingException(
-                $"{GetType().Name}: unexpected error — {ex.Message}", ex);
+                $"{GetType().Name}: unexpected error for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}): {ex.Message}", ex);
         }
     }
 
     private static string BuildUrl(IntegrationSystem system, IntegrationRequest request)
-    {
-        var path = string.IsNullOrWhiteSpace(request.EndpointPath)
-            ? system.EndpointPath : request.EndpointPath;
-        return $"{system.BaseAddress.TrimEnd('/')}/{path.TrimStart('/')}";
-    }
+        => UrlBuilder.Build(system, request);
 
     private static void SafeClose(IClientChannel channel)
     {

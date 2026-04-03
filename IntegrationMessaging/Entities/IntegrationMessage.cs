@@ -18,7 +18,7 @@ public class IntegrationMessage
     public int RetryCount { get; set; } = 0;
     public string Status { get; set; } = string.Empty;
     public string RequestPayload { get; set; } = string.Empty;
-    public string ResponsePayload { get; set; } = string.Empty;
+    public string? ResponsePayload { get; set; } 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? UpdatedAt { get; set; }
     public string? Error { get; set; }

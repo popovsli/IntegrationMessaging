@@ -8,5 +8,4 @@ public sealed class IntegrationMessagingOptions
     public int PollIntervalSeconds { get; set; } = 5;
     public int LockDurationMinutes { get; set; } = 5;
     public int EndpointCacheMinutes { get; set; } = 5;
-    public int TokenCacheSkewSeconds { get; set; } = 30;
 }

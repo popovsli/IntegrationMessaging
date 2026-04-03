@@ -3,6 +3,7 @@ using IntegrationMessaging.Entities;
 using IntegrationMessaging.Exceptions;
 using IntegrationMessaging.Models;
 using IntegrationMessaging.Services.Clients.Soap;
+using IntegrationMessaging.Services.Resilience;
 using Microsoft.Extensions.Logging;
 using System.ServiceModel;
 using System.ServiceModel.Channels;
@@ -13,6 +14,7 @@ namespace IntegrationMessaging.Services.Clients.Base;
 
 public abstract class SoapIntegrationClientBase(
     ISoapChannelFactoryManager<IRequestChannel> factoryManager,
+    IResiliencePipelineFactory pipelineFactory,
     ILogger logger) : IIntegrationClient
 {
     // ── Subclass configures the WCF binding entirely in code ─────────────
@@ -24,7 +26,8 @@ public abstract class SoapIntegrationClientBase(
     protected abstract ChannelFactory<IRequestChannel> CreateFactory(
         string username, string password);
 
-    // ── IIntegrationClient ───────────────────────────────────────────────
+
+    // ── Public entry point — Polly wraps ExecuteOnceAsync ────────────────
 
     public async Task<IntegrationResponse> SendAsync(
         IntegrationRequest request,
@@ -33,12 +36,45 @@ public abstract class SoapIntegrationClientBase(
     {
         if (string.IsNullOrWhiteSpace(request.SoapAction))
             throw new IntegrationMessagingException(
-                $"{GetType().Name} requires a SoapAction on the IntegrationRequest.");
+                $"{GetType().Name} requires SoapAction on IntegrationRequest. " +
+                $"Set IntegrationEndpoint.SoapAction for system " +
+                $"'{system.IntegrationSystemCode}'.");
 
+        var pipeline = pipelineFactory.CreateSoapPipeline(system);
+        try
+        {
+            return await pipeline.ExecuteAsync(
+                async token => await ExecuteOnceAsync(request, system, token), ct);
+        }
+        catch (CommunicationException ex)
+        {
+            throw new IntegrationMessagingException(
+                $"{GetType().Name}: WCF communication failed for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}) " +
+                $"after {system.ClientRetryCount} retries — {ex.Message}", ex);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new IntegrationMessagingException(
+                $"{GetType().Name}: WCF timed out for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}) " +
+                $"after {system.ClientRetryCount} retries — {ex.Message}", ex);
+        }
+    }
+
+    // ── IIntegrationClient ───────────────────────────────────────────────
+
+    private async Task<IntegrationResponse> ExecuteOnceAsync(
+       IntegrationRequest request,
+       IntegrationSystem system,
+       CancellationToken ct)
+    {
         var url = BuildUrl(system, request);
 
-        logger.LogDebug("{Client} → {SoapAction} | {Url}",
-            GetType().Name, request.SoapAction, url);
+        logger.LogDebug(
+            "{Client} → {SoapAction} | {Url} | System={SystemName} [{SystemCode}]",
+            GetType().Name, request.SoapAction, url,
+            system.SystemName, system.IntegrationSystemCode);
 
         IRequestChannel? channel = null;
         try
@@ -48,28 +84,34 @@ public abstract class SoapIntegrationClientBase(
             channel = factory.CreateChannel(new EndpointAddress(url));
             channel.Open();
 
-            using var wcfMessage = CreateMessage(request.Payload, request.SoapAction);
+            using var wcfMessage = CreateMessage(request.Payload!, request.SoapAction!);
+
+            // Correct — APM wrapped in TAP, cancellation via .WaitAsync()
             using var reply = await Task.Factory.FromAsync(
                 channel.BeginRequest(wcfMessage, null, null),
-                channel.EndRequest);
+                channel.EndRequest)
+                .WaitAsync(ct);   // .NET 6+ — throws OperationCanceledException if ct fires
 
             var xml = ReadMessage(reply);
 
-            logger.LogDebug("{Client} ← Faulted={IsFault}", GetType().Name, reply.IsFault);
-
-
             var fault = SoapFaultParser.TryParse(xml);
-
             if (fault is not null)
             {
-                logger.LogWarning("{Client} SOAP Fault | Code={Code} Reason={Reason}",
-                    GetType().Name, fault.Code, fault.Reason);
+                logger.LogWarning(
+                    "{Client} SOAP Fault | Code={Code} Reason={Reason} | " +
+                    "System={SystemName} [{SystemCode}]",
+                    GetType().Name, fault.Code, fault.Reason,
+                    system.SystemName, system.IntegrationSystemCode);
 
                 return IntegrationResponse.Fault(fault, xml);
             }
 
             SafeClose(channel);
             channel = null;
+
+            logger.LogDebug(
+                "{Client} ← success | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
 
             return IntegrationResponse.Ok(SoapFaultParser.ExtractBody(xml));
         }
@@ -81,26 +123,31 @@ public abstract class SoapIntegrationClientBase(
         catch (CommunicationException ex)
         {
             channel?.Abort();
-            // Factory may be in faulted state — discard it so next call rebuilds
             factoryManager.Invalidate(system.IntegrationSystemCode);
-            logger.LogError(ex, "{Client} CommunicationException", GetType().Name);
-            throw new IntegrationMessagingException(
-                $"{GetType().Name}: WCF communication failed — {ex.Message}", ex);
+            logger.LogWarning(ex,
+                "{Client} CommunicationException (retry eligible) | " +
+                "System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
+            throw;   // ← rethrow — Polly retries, SendAsync wraps after exhaustion
         }
         catch (TimeoutException ex)
         {
             channel?.Abort();
-            logger.LogError(ex, "{Client} Timeout", GetType().Name);
-            throw new IntegrationMessagingException(
-                $"{GetType().Name}: WCF call timed out — {ex.Message}", ex);
+            logger.LogWarning(ex,
+                "{Client} Timeout (retry eligible) | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
+            throw;   // ← rethrow — Polly retries
         }
         catch (Exception ex)
         {
             channel?.Abort();
             factoryManager.Invalidate(system.IntegrationSystemCode);
-            logger.LogError(ex, "{Client} unexpected error", GetType().Name);
+            logger.LogError(ex,
+                "{Client} unexpected error | System={SystemName} [{SystemCode}]",
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
             throw new IntegrationMessagingException(
-                $"{GetType().Name}: unexpected error — {ex.Message}", ex);
+                $"{GetType().Name}: unexpected error for " +
+                $"'{system.SystemName}' ({system.IntegrationSystemCode}): {ex.Message}", ex);
         }
     }
 
@@ -137,12 +184,7 @@ public abstract class SoapIntegrationClientBase(
     }
 
     private static string BuildUrl(IntegrationSystem system, IntegrationRequest request)
-    {
-        var path = string.IsNullOrWhiteSpace(request.EndpointPath)
-            ? system.EndpointPath
-            : request.EndpointPath;
-        return $"{system.BaseAddress.TrimEnd('/')}/{path.TrimStart('/')}";
-    }
+    => UrlBuilder.Build(system, request);
 
     private static void SafeClose(IRequestChannel channel)
     {

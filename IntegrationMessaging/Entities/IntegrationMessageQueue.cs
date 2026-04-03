@@ -19,6 +19,8 @@ public class IntegrationMessageQueue
     public int AttemptCount { get; set; } = 0;
     public DateTime CreationTime { get; set; } = DateTime.UtcNow;
 
+    public Guid? WorkerStamp { get; set; }
+
     /// <summary>
     /// Worker exclusive lock. Another worker skips this row until LockedUntil expires.
     /// </summary>

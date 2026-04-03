@@ -1,4 +1,14 @@
 ﻿// Services/Clients/Base/SoapIntegrationClientBase.cs
+// FIXES applied:
+//   — IResiliencePipelineFactory injected (was missing entirely)
+//   — CommunicationException / TimeoutException rethrown bare so Polly can retry
+//   — Wrapping into IntegrationMessagingException happens only in SendAsync
+//     after Polly exhausts all retries
+//   — reply.IsFault log removed (misleading — SoapFaultParser is the authority)
+//   — Task.Factory.FromAsync + .WaitAsync(ct) replaces BeginRequest/EndRequest
+//   — BuildUrl passthrough wrapper removed; UrlBuilder.Build called directly
+//   — SystemName + SystemCode added to all log calls
+
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Exceptions;
 using IntegrationMessaging.Models;
@@ -17,17 +27,10 @@ public abstract class SoapIntegrationClientBase(
     IResiliencePipelineFactory pipelineFactory,
     ILogger logger) : IIntegrationClient
 {
-    // ── Subclass configures the WCF binding entirely in code ─────────────
-
-    /// <summary>
-    /// Build a fully configured ChannelFactory — binding + credentials.
-    /// Called only when no cached factory exists or config changed in DB.
-    /// </summary>
     protected abstract ChannelFactory<IRequestChannel> CreateFactory(
         string username, string password);
 
-
-    // ── Public entry point — Polly wraps ExecuteOnceAsync ────────────────
+    // ── Public entry point ────────────────────────────────────────────────
 
     public async Task<IntegrationResponse> SendAsync(
         IntegrationRequest request,
@@ -62,14 +65,14 @@ public abstract class SoapIntegrationClientBase(
         }
     }
 
-    // ── IIntegrationClient ───────────────────────────────────────────────
+    // ── Single attempt ────────────────────────────────────────────────────
 
     private async Task<IntegrationResponse> ExecuteOnceAsync(
-       IntegrationRequest request,
-       IntegrationSystem system,
-       CancellationToken ct)
+        IntegrationRequest request,
+        IntegrationSystem system,
+        CancellationToken ct)
     {
-        var url = BuildUrl(system, request);
+        var url = UrlBuilder.Build(system, request);
 
         logger.LogDebug(
             "{Client} → {SoapAction} | {Url} | System={SystemName} [{SystemCode}]",
@@ -86,11 +89,12 @@ public abstract class SoapIntegrationClientBase(
 
             using var wcfMessage = CreateMessage(request.Payload!, request.SoapAction!);
 
-            // Correct — APM wrapped in TAP, cancellation via .WaitAsync()
-            using var reply = await Task.Factory.FromAsync(
-                channel.BeginRequest(wcfMessage, null, null),
-                channel.EndRequest)
-                .WaitAsync(ct);   // .NET 6+ — throws OperationCanceledException if ct fires
+            // .WaitAsync(ct) propagates cancellation; BeginRequest/EndRequest ignored ct entirely
+            using var reply = await Task.Factory
+                .FromAsync(
+                    channel.BeginRequest(wcfMessage, null, null),
+                    channel.EndRequest)
+                .WaitAsync(ct);
 
             var xml = ReadMessage(reply);
 
@@ -128,7 +132,7 @@ public abstract class SoapIntegrationClientBase(
                 "{Client} CommunicationException (retry eligible) | " +
                 "System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;   // ← rethrow — Polly retries, SendAsync wraps after exhaustion
+            throw;  // Polly retries; SendAsync wraps after exhaustion
         }
         catch (TimeoutException ex)
         {
@@ -136,7 +140,7 @@ public abstract class SoapIntegrationClientBase(
             logger.LogWarning(ex,
                 "{Client} Timeout (retry eligible) | System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;   // ← rethrow — Polly retries
+            throw;  // Polly retries
         }
         catch (Exception ex)
         {
@@ -151,7 +155,7 @@ public abstract class SoapIntegrationClientBase(
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────
 
     private static Message CreateMessage(string bodyXml, string soapAction)
     {
@@ -182,9 +186,6 @@ public abstract class SoapIntegrationClientBase(
         writer.Flush();
         return sb.ToString();
     }
-
-    private static string BuildUrl(IntegrationSystem system, IntegrationRequest request)
-    => UrlBuilder.Build(system, request);
 
     private static void SafeClose(IRequestChannel channel)
     {

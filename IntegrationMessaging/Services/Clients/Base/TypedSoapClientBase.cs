@@ -1,12 +1,17 @@
 ﻿// Services/Clients/Base/TypedSoapClientBase.cs
+// FIX #10: namespace declaration added (was missing — class fell into global namespace).
+// Previous fixes already applied: goto removed, CommunicationException/TimeoutException
+// rethrown bare inside ExecuteOnceAsync so Polly can retry them.
+
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Exceptions;
 using IntegrationMessaging.Models;
-using IntegrationMessaging.Services.Clients;
 using IntegrationMessaging.Services.Clients.Soap;
 using IntegrationMessaging.Services.Resilience;
 using Microsoft.Extensions.Logging;
 using System.ServiceModel;
+
+namespace IntegrationMessaging.Services.Clients.Base;
 
 public abstract class TypedSoapClientBase<TContract>(
     ISoapChannelFactoryManager<TContract> factoryManager,
@@ -15,23 +20,20 @@ public abstract class TypedSoapClientBase<TContract>(
     where TContract : class
 {
     protected abstract ChannelFactory<TContract> CreateFactory(
-      string username, string password);
+        string username, string password);
 
-    /// <summary>
-    /// Executes the typed WCF call.
-    /// Return a serialized response string (JSON recommended) if the operation
-    /// returns meaningful data. Return null for void/one-way operations.
-    /// </summary>
     protected abstract Task<string?> InvokeContractAsync(
         TContract channel,
         IntegrationRequest request,
         SendContext context,
         CancellationToken ct);
 
+    // ── Public entry point — Polly wraps ExecuteOnceAsync ────────────────
+
     public async Task<IntegrationResponse> SendAsync(
-      IntegrationRequest request,
-      IntegrationSystem system,
-      CancellationToken ct = default)
+        IntegrationRequest request,
+        IntegrationSystem system,
+        CancellationToken ct = default)
     {
         var pipeline = pipelineFactory.CreateSoapPipeline(system);
         try
@@ -41,7 +43,6 @@ public abstract class TypedSoapClientBase<TContract>(
         }
         catch (CommunicationException ex)
         {
-            // Polly exhausted all retries — wrap for caller
             throw new IntegrationMessagingException(
                 $"{GetType().Name}: WCF communication failed for " +
                 $"'{system.SystemName}' ({system.IntegrationSystemCode}) " +
@@ -56,59 +57,67 @@ public abstract class TypedSoapClientBase<TContract>(
         }
     }
 
+    // ── Single attempt — no retry logic here, Polly owns that ────────────
+
     private async Task<IntegrationResponse> ExecuteOnceAsync(
         IntegrationRequest request,
         IntegrationSystem system,
-        CancellationToken ct = default)
+        CancellationToken ct)
     {
-        var url = BuildUrl(system, request);
+        var url = UrlBuilder.Build(system, request);
 
         logger.LogDebug("{Client} → {Url} | System={SystemName} [{SystemCode}]",
-                   GetType().Name, url, system.SystemName, system.IntegrationSystemCode);
+            GetType().Name, url, system.SystemName, system.IntegrationSystemCode);
 
         TContract? channel = default;
         try
         {
-            // Manager handles cache, fingerprint, invalidation — no duplicate logic
             var factory = factoryManager.GetOrCreate(system, CreateFactory);
 
             channel = factory.CreateChannel(new EndpointAddress(url));
             ((IClientChannel)channel).Open();
 
-            var payload = await InvokeContractAsync(channel, request, request.Context!, ct);
+            var payload = await InvokeContractAsync(
+                channel, request, request.Context!, ct);
 
             SafeClose((IClientChannel)channel);
             channel = default;
 
             logger.LogDebug("{Client} ← success | System={SystemName} [{SystemCode}]",
-               GetType().Name, system.SystemName, system.IntegrationSystemCode);
+                GetType().Name, system.SystemName, system.IntegrationSystemCode);
 
-            return IntegrationResponse.Ok(payload);  // null is fine — Ok() accepts null
+            return IntegrationResponse.Ok(payload);
+        }
+        catch (FaultException ex)
+        {
+            ((IClientChannel?)channel)?.Abort();
+            logger.LogWarning(
+                "{Client} SOAP Fault: {Message} | System={SystemName} [{SystemCode}]",
+                GetType().Name, ex.Message,
+                system.SystemName, system.IntegrationSystemCode);
+            return IntegrationResponse.FaultFromException(ex);
         }
         catch (CommunicationException ex)
         {
-            // Transient — invalidate factory, rethrow for Polly to retry
             ((IClientChannel?)channel)?.Abort();
             factoryManager.Invalidate(system.IntegrationSystemCode);
             logger.LogWarning(ex,
                 "{Client} CommunicationException (retry eligible) | System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;
+            throw;  // Polly retries; SendAsync wraps after exhaustion
         }
         catch (TimeoutException ex)
         {
-            // Transient — rethrow for Polly to retry
             ((IClientChannel?)channel)?.Abort();
             logger.LogWarning(ex,
                 "{Client} Timeout (retry eligible) | System={SystemName} [{SystemCode}]",
                 GetType().Name, system.SystemName, system.IntegrationSystemCode);
-            throw;
+            throw;  // Polly retries
         }
         catch (IntegrationMessagingException)
         {
-            // Config/contract error — never retry
             ((IClientChannel?)channel)?.Abort();
-            throw;
+            throw;  // config/contract error — never retry
         }
         catch (Exception ex)
         {
@@ -122,9 +131,6 @@ public abstract class TypedSoapClientBase<TContract>(
                 $"'{system.SystemName}' ({system.IntegrationSystemCode}): {ex.Message}", ex);
         }
     }
-
-    private static string BuildUrl(IntegrationSystem system, IntegrationRequest request)
-        => UrlBuilder.Build(system, request);
 
     private static void SafeClose(IClientChannel channel)
     {

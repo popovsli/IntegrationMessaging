@@ -1,6 +1,7 @@
 ﻿// Systems/PortAuthorityA/PortAuthorityAClient.cs
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Services.Clients.Base;
+using IntegrationMessaging.Services.Resilience;
 using IntegrationMessaging.Services.TokenProviders;
 using Microsoft.Extensions.Logging;
 using System.Net.Http.Headers;
@@ -10,8 +11,9 @@ namespace IntegrationMessaging.Services.IntegrationClients;
 public sealed class PortAuthorityAClient(
     IHttpClientFactory httpFactory,
     ITokenProvider tokenProvider,
+    IResiliencePipelineFactory pipelineFactory,
     ILogger<PortAuthorityAClient> logger)
-    : RestIntegrationClientBase(httpFactory, logger)
+    : RestIntegrationClientBase(httpFactory, pipelineFactory, logger)
 {
     protected override string HttpClientName => "PORT_A";
 

@@ -2,6 +2,7 @@
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Models;
 using IntegrationMessaging.Services.Clients.Base;
+using IntegrationMessaging.Services.Resilience;
 using Microsoft.Extensions.Logging;
 using System.Text;
 
@@ -9,8 +10,9 @@ namespace IntegrationMessaging.Services.IntegrationClients;
 
 public sealed class BdzSiteScheduleClient(
     IHttpClientFactory httpFactory,
+    IResiliencePipelineFactory pipelineFactory,
     ILogger<BdzSiteScheduleClient> logger)
-    : RestIntegrationClientBase(httpFactory, logger)
+    : RestIntegrationClientBase(httpFactory, pipelineFactory, logger)
 {
     protected override string HttpClientName => "BDZ_SITE_SCHEDULE";
 

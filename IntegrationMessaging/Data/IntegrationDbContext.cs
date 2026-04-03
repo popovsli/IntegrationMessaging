@@ -105,6 +105,9 @@ public class IntegrationDbContext(DbContextOptions<IntegrationDbContext> options
              .WithMany(s => s.QueueMessages)
              .HasForeignKey(x => x.IntegrationSystemCode)
              .OnDelete(DeleteBehavior.Restrict);
+
+            e.Property(x => x.WorkerStamp);
+            e.HasIndex(x => x.WorkerStamp);
         });
 
         // ── IntegrationMessage (history) ──────────────────────────────────

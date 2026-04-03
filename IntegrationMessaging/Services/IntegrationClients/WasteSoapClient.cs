@@ -3,10 +3,12 @@ using Azure;
 using IntegrationMessaging.Entities.Enums;
 using IntegrationMessaging.Exceptions;
 using IntegrationMessaging.Models;
+using IntegrationMessaging.Services.Clients.Base;
 using IntegrationMessaging.Services.Clients.Soap;
 using IntegrationMessaging.Services.Handlers;
 using IntegrationMessaging.Services.IntegrationClients.Contracts;
 using IntegrationMessaging.Services.IntegrationClients.DTOs;
+using IntegrationMessaging.Services.Resilience;
 using Microsoft.Extensions.Logging;
 using System.ServiceModel;
 using System.Text.Json;
@@ -14,9 +16,10 @@ using System.Text.Json;
 namespace IntegrationMessaging.Services.IntegrationClients;
 
 public sealed class WasteSoapClient(
-    ISoapChannelFactoryManager<IWasteService> factoryManager,  // ← typed correctly
+    ISoapChannelFactoryManager<IWasteService> factoryManager,
+    IResiliencePipelineFactory pipelineFactory,
     ILogger<WasteSoapClient> logger)
-    : TypedSoapClientBase<IWasteService>(factoryManager, logger)
+    : TypedSoapClientBase<IWasteService>(factoryManager, pipelineFactory, logger)
 {
     // ── Binding: entirely in code ─────────────────────────────────────────
 

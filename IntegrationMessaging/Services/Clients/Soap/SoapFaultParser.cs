@@ -1,3 +1,8 @@
+// Services/Clients/Soap/SoapFaultParser.cs
+// FIX #8: XmlDocument DOM replaced with forward-only XmlReader to reduce
+//          allocations on every SOAP response in high-throughput scenarios.
+
+using IntegrationMessaging.Models;
 using System.Xml;
 
 namespace IntegrationMessaging.Services.Clients.Soap;
@@ -6,55 +11,105 @@ public sealed record SoapFault(string Code, string Reason, string? Detail = null
 
 public static class SoapFaultParser
 {
+    private static readonly XmlReaderSettings ReaderSettings = new()
+    {
+        IgnoreWhitespace = true,
+        IgnoreComments = true,
+        DtdProcessing = DtdProcessing.Prohibit,
+        ConformanceLevel = ConformanceLevel.Document
+    };
+
+    // FIX #8: forward-only streaming parse — no XmlDocument allocation
     public static SoapFault? TryParse(string responseXml)
     {
         if (string.IsNullOrWhiteSpace(responseXml)) return null;
 
         try
         {
-            var doc = new XmlDocument();
-            doc.LoadXml(responseXml);
+            using var reader = XmlReader.Create(
+                new StringReader(responseXml), ReaderSettings);
 
-            var nsMgr = new XmlNamespaceManager(doc.NameTable);
-            nsMgr.AddNamespace("s11", "http://schemas.xmlsoap.org/soap/envelope/");
-            nsMgr.AddNamespace("s12", "http://www.w3.org/2003/05/soap-envelope");
-
-            var fault11 = doc.SelectSingleNode("//s11:Fault", nsMgr);
-            if (fault11 is not null)
+            while (reader.Read())
             {
-                var code   = fault11.SelectSingleNode("faultcode")?.InnerText   ?? "Unknown";
-                var reason = fault11.SelectSingleNode("faultstring")?.InnerText ?? "Unknown fault";
-                var detail = fault11.SelectSingleNode("detail")?.InnerXml;
-                return new SoapFault(code, reason, detail);
-            }
+                if (reader.NodeType != XmlNodeType.Element
+                    || reader.LocalName != "Fault")
+                    continue;
 
-            var fault12 = doc.SelectSingleNode("//s12:Fault", nsMgr);
-            if (fault12 is not null)
-            {
-                var code   = fault12.SelectSingleNode("s12:Code/s12:Value", nsMgr)?.InnerText   ?? "Unknown";
-                var reason = fault12.SelectSingleNode("s12:Reason/s12:Text", nsMgr)?.InnerText ?? "Unknown fault";
-                var detail = fault12.SelectSingleNode("s12:Detail", nsMgr)?.InnerXml;
-                return new SoapFault(code, reason, detail);
-            }
+                // Found <soap:Fault> — read children
+                string? code = null, reason = null, detail = null;
 
+                while (reader.Read() && !(reader.NodeType == XmlNodeType.EndElement
+                                          && reader.LocalName == "Fault"))
+                {
+                    if (reader.NodeType != XmlNodeType.Element) continue;
+
+                    switch (reader.LocalName)
+                    {
+                        // SOAP 1.1
+                        case "faultcode":
+                            code = reader.ReadElementContentAsString();
+                            break;
+                        case "faultstring":
+                            reason = reader.ReadElementContentAsString();
+                            break;
+                        case "detail":
+                            detail = reader.ReadInnerXml();
+                            break;
+                        // SOAP 1.2
+                        case "Code":
+                        case "Value":
+                            code ??= reader.ReadElementContentAsString();
+                            break;
+                        case "Reason":
+                        case "Text":
+                            reason ??= reader.ReadElementContentAsString();
+                            break;
+                        case "Detail":
+                            detail ??= reader.ReadInnerXml();
+                            break;
+                    }
+                }
+
+                return new SoapFault(
+                    Code: code ?? "Unknown",
+                    Reason: reason ?? "Unknown",
+                    Detail: detail);
+            }
+        }
+        catch (XmlException)
+        {
+            // Malformed response — not a SOAP fault we can parse
             return null;
         }
-        catch { return null; }
+
+        return null;
     }
 
-    public static string? ExtractBody(string responseXml)
+    /// <summary>
+    /// Extracts the inner XML of &lt;soap:Body&gt; from a full SOAP envelope string.
+    /// Returns null if the Body element is not found.
+    /// </summary>
+    public static string? ExtractBody(string envelopeXml)
     {
-        if (string.IsNullOrWhiteSpace(responseXml)) return null;
+        if (string.IsNullOrWhiteSpace(envelopeXml)) return null;
+
         try
         {
-            var doc = new XmlDocument();
-            doc.LoadXml(responseXml);
-            var nsMgr = new XmlNamespaceManager(doc.NameTable);
-            nsMgr.AddNamespace("s11", "http://schemas.xmlsoap.org/soap/envelope/");
-            nsMgr.AddNamespace("s12", "http://www.w3.org/2003/05/soap-envelope");
-            return doc.SelectSingleNode("//s11:Body", nsMgr)?.InnerXml
-                ?? doc.SelectSingleNode("//s12:Body", nsMgr)?.InnerXml;
+            using var reader = XmlReader.Create(
+                new StringReader(envelopeXml), ReaderSettings);
+
+            while (reader.Read())
+            {
+                if (reader.NodeType == XmlNodeType.Element
+                    && reader.LocalName == "Body")
+                    return reader.ReadInnerXml();
+            }
         }
-        catch { return null; }
+        catch (XmlException)
+        {
+            return null;
+        }
+
+        return null;
     }
 }

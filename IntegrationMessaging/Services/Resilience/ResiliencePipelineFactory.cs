@@ -1,9 +1,14 @@
 ﻿// Services/Resilience/ResiliencePipelineFactory.cs
+// FIX #9: Pipelines are cached per IntegrationSystemCode instead of being
+//          rebuilt on every call.  Building a ResiliencePipeline allocates
+//          several internal Polly objects — reusing them is the intended pattern.
+
 using IntegrationMessaging.Entities;
 using IntegrationMessaging.Models;
 using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.Retry;
+using System.Collections.Concurrent;
 using System.Net;
 using System.ServiceModel;
 
@@ -12,25 +17,30 @@ namespace IntegrationMessaging.Services.Resilience;
 public sealed class ResiliencePipelineFactory(
     ILogger<ResiliencePipelineFactory> logger) : IResiliencePipelineFactory
 {
+    // FIX #9: cached per system code — pipelines are designed for reuse
+    private readonly ConcurrentDictionary<string, ResiliencePipeline<IntegrationResponse>>
+        _restPipelines = new();
+    private readonly ConcurrentDictionary<string, ResiliencePipeline<IntegrationResponse>>
+        _soapPipelines = new();
+
     public ResiliencePipeline<IntegrationResponse> CreateRestPipeline(
         IntegrationSystem system) =>
-        BuildPipeline(
-            system,
-            new PredicateBuilder<IntegrationResponse>()
-                .Handle<HttpRequestException>()
-                .HandleResult(r =>
-                    r.HttpStatusCode >= (int)HttpStatusCode.InternalServerError));
+        _restPipelines.GetOrAdd(system.IntegrationSystemCode,
+            _ => BuildPipeline(system,
+                new PredicateBuilder<IntegrationResponse>()
+                    .Handle<HttpRequestException>()
+                    .HandleResult(r =>
+                        r.HttpStatusCode >= (int)HttpStatusCode.InternalServerError)));
 
     public ResiliencePipeline<IntegrationResponse> CreateSoapPipeline(
         IntegrationSystem system) =>
-        BuildPipeline(
-            system,
-            new PredicateBuilder<IntegrationResponse>()
-                .Handle<CommunicationException>()   // transient WCF transport failure
-                .Handle<TimeoutException>());        // endpoint slow or overloaded
-                                                     // FaultException excluded — business rejection
+        _soapPipelines.GetOrAdd(system.IntegrationSystemCode,
+            _ => BuildPipeline(system,
+                new PredicateBuilder<IntegrationResponse>()
+                    .Handle<CommunicationException>()   // transient WCF transport failure
+                    .Handle<TimeoutException>()));       // FaultException excluded — business rejection
 
-    // ── Shared builder — same retry shape for all protocols ──────────────
+    // ── Shared builder ────────────────────────────────────────────────────
 
     private ResiliencePipeline<IntegrationResponse> BuildPipeline(
         IntegrationSystem system,
@@ -44,7 +54,7 @@ public sealed class ResiliencePipelineFactory(
                 // Exponential backoff: 2s → 4s → 8s…
                 Delay = TimeSpan.FromSeconds(2),
                 BackoffType = DelayBackoffType.Exponential,
-                UseJitter = true,   // spread retries across concurrent workers
+                UseJitter = true,   // avoids retry storms across concurrent workers
 
                 OnRetry = args =>
                 {
